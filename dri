@@ -1,0 +1,508 @@
+{
+  "name": "secret-role-coin-game",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  }
+}
+
+# 헬조선
+
+비밀 직업 2개와 코인으로 진행하는 멀티플레이 웹 게임입니다.
+
+## 실행
+
+```bash
+npm start
+```
+
+호스트 PC에서 실행한 뒤 같은 네트워크에서는 `http://호스트IP:5173`으로 접속합니다.
+
+## 인터넷으로 같이 하기
+
+같은 와이파이가 아니어도 하려면 이 프로젝트를 Render, Railway, Fly.io 같은 Node.js 서버에 배포하세요. 앱은 상대 경로 API를 사용해서 배포 주소 그대로 접속하면 동작합니다.
+
+게임 데이터는 기본적으로 `work/rooms.json`에 저장됩니다. 서버의 영구 저장소 경로가 따로 있으면 아래처럼 지정할 수 있습니다.
+
+```bash
+DATA_DIR=/var/data npm start
+```
+
+## 룰 메모
+
+- 직업 덱은 대통령, 법무관, 경찰, 산업스파이, 군인, 학생이 각각 2장씩입니다.
+- 플레이어마다 서로 다른 직업 2개를 받습니다.
+- 직업 덱 특성상 최대 6명까지 참가할 수 있습니다.
+
+services:
+  - type: web
+    name: hell-joseon
+    runtime: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+const PORT = process.env.PORT || 5173;
+const PUBLIC_DIR = path.join(__dirname, "public");
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "work");
+const DATA_FILE = path.join(DATA_DIR, "rooms.json");
+const DEFAULT_ROOM_CODE = "MAIN";
+const ROLES = ["대통령", "법무관", "경찰", "산업스파이", "군인", "학생"];
+const MAX_PLAYERS = ROLES.length;
+
+const rooms = new Map();
+
+function loadRooms() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const savedRooms = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    savedRooms.forEach((room) => rooms.set(room.code, room));
+  } catch (error) {
+    console.warn(`방 저장 파일을 읽지 못했습니다: ${error.message}`);
+  }
+}
+
+function saveRooms() {
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    fs.writeFileSync(DATA_FILE, JSON.stringify([...rooms.values()], null, 2), "utf8");
+  } catch (error) {
+    console.warn(`방 저장 파일을 쓰지 못했습니다: ${error.message}`);
+  }
+}
+
+function id() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+function roomCode() {
+  let code = "";
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  for (let i = 0; i < 5; i += 1) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return code;
+}
+
+function chooseTwoRoles() {
+  const pool = [...ROLES];
+  const first = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+  const second = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+  return [first, second];
+}
+
+function shuffle(items) {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function dealRolePairs(playerCount) {
+  if (playerCount > MAX_PLAYERS) {
+    throw new Error(`직업 덱은 최대 ${MAX_PLAYERS}명까지 지원합니다.`);
+  }
+
+  const deck = ROLES.flatMap((role) => [role, role]);
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const shuffled = shuffle(deck);
+    const pairs = [];
+    const pairKeys = new Set();
+    let valid = true;
+    for (let i = 0; i < playerCount; i += 1) {
+      const pair = [shuffled[i * 2], shuffled[i * 2 + 1]];
+      const pairKey = [...pair].sort().join("|");
+      if (pair[0] === pair[1] || pairKeys.has(pairKey)) {
+        valid = false;
+        break;
+      }
+      pairKeys.add(pairKey);
+      pairs.push(pair);
+    }
+    if (valid) return pairs;
+  }
+
+  throw new Error("직업을 공정하게 섞지 못했습니다. 다시 시도해주세요.");
+}
+
+function publicPlayer(player, viewerId) {
+  const isSelf = player.id === viewerId;
+  return {
+    id: player.id,
+    name: player.name,
+    coins: player.coins,
+    alive: player.alive,
+    roleCount: player.roles.length,
+    roles: isSelf ? player.roles : undefined,
+    usedPolice: isSelf ? player.usedPolice : undefined,
+    skipped: player.skipped,
+  };
+}
+
+function currentPlayer(room) {
+  return room.players[room.turnIndex] || null;
+}
+
+function alivePlayers(room) {
+  return room.players.filter((player) => player.alive);
+}
+
+function log(room, message, privateTo = null) {
+  room.log.unshift({ at: new Date().toLocaleTimeString("ko-KR"), message, privateTo });
+  room.log = room.log.slice(0, 60);
+  saveRooms();
+}
+
+function assignRoles(room) {
+  const alive = room.players.filter((player) => player.alive);
+  const pairs = dealRolePairs(alive.length);
+  alive.forEach((player, index) => {
+    player.roles = pairs[index];
+  });
+}
+
+function normalizeTurnIndex(room) {
+  if (!room.players.length) {
+    room.turnIndex = 0;
+    return;
+  }
+  for (let i = 0; i < room.players.length; i += 1) {
+    const player = room.players[room.turnIndex % room.players.length];
+    if (player && player.alive) return;
+    room.turnIndex = (room.turnIndex + 1) % room.players.length;
+  }
+}
+
+function beginTurn(room) {
+  normalizeTurnIndex(room);
+  const player = currentPlayer(room);
+  if (!player || room.status !== "playing") return;
+
+  if (player.skipped) {
+    player.skipped = false;
+    log(room, `${player.name}님의 차례가 군인 능력으로 넘어갔습니다.`);
+    nextTurn(room, false);
+    return;
+  }
+
+  const income = player.roles.includes("학생") ? 2 : 1;
+  player.coins += income;
+  room.pendingAction = true;
+  log(room, `${player.name}님이 차례 보상으로 ${income}코인을 받았습니다.`);
+}
+
+function nextTurn(room, shouldBegin = true) {
+  if (room.status !== "playing") return;
+  const alive = alivePlayers(room);
+  if (alive.length <= 1) {
+    room.status = "ended";
+    room.winnerId = alive[0]?.id || null;
+    log(room, alive[0] ? `${alive[0].name}님이 승리했습니다.` : "승자가 없이 게임이 끝났습니다.");
+    return;
+  }
+
+  room.pendingAction = false;
+  for (let i = 0; i < room.players.length; i += 1) {
+    room.turnIndex = (room.turnIndex + 1) % room.players.length;
+    if (room.players[room.turnIndex].alive) break;
+  }
+  if (shouldBegin) beginTurn(room);
+}
+
+function requireTurn(room, playerId) {
+  return room.status === "playing" && room.pendingAction && currentPlayer(room)?.id === playerId;
+}
+
+function removeRandomRole(room, target) {
+  if (!target.roles.length) return null;
+  const index = Math.floor(Math.random() * target.roles.length);
+  const [removed] = target.roles.splice(index, 1);
+  if (!target.roles.length) {
+    target.alive = false;
+    log(room, `${target.name}님은 모든 직업을 잃고 탈락했습니다.`);
+  }
+  return removed;
+}
+
+function serializeRoom(room, viewerId) {
+  return {
+    code: room.code,
+    hostId: room.hostId,
+    status: room.status,
+    players: room.players.map((player) => publicPlayer(player, viewerId)),
+    me: room.players.find((player) => player.id === viewerId) || null,
+    currentPlayerId: currentPlayer(room)?.id || null,
+    pendingAction: room.pendingAction,
+    winnerId: room.winnerId,
+    presidentBlocked: room.presidentBlocked,
+    log: room.log.filter((item) => !item.privateTo || item.privateTo === viewerId),
+    roles: ROLES,
+  };
+}
+
+function getBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1e6) req.destroy();
+    });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+function sendJson(res, status, data) {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(data));
+}
+
+function findRoom(code) {
+  return rooms.get(String(code || "").trim().toUpperCase());
+}
+
+function createPlayer(name) {
+  return {
+    id: id(),
+    name: String(name || "플레이어").trim().slice(0, 16),
+    coins: 0,
+    roles: [],
+    alive: true,
+    usedPolice: false,
+    skipped: false,
+  };
+}
+
+function createRoom(code, hostPlayer) {
+  return {
+    code,
+    hostId: hostPlayer.id,
+    status: "lobby",
+    players: [hostPlayer],
+    turnIndex: 0,
+    pendingAction: false,
+    winnerId: null,
+    presidentBlocked: false,
+    log: [],
+  };
+}
+
+function getDefaultRoom() {
+  return rooms.get(DEFAULT_ROOM_CODE);
+}
+
+async function handleApi(req, res) {
+  try {
+    const body = await getBody(req);
+
+    if (req.url === "/api/create" && req.method === "POST") {
+      const code = roomCode();
+      const player = createPlayer(body.name);
+      const room = createRoom(code, player);
+      rooms.set(code, room);
+      log(room, `${player.name}님이 방을 만들었습니다.`);
+      sendJson(res, 200, { room: serializeRoom(room, player.id), playerId: player.id });
+      return;
+    }
+
+    if (req.url === "/api/join" && req.method === "POST") {
+      let room = body.code ? findRoom(body.code) : getDefaultRoom();
+      const player = createPlayer(body.name);
+      if (room && !body.code && room.status === "ended") {
+        room = createRoom(DEFAULT_ROOM_CODE, player);
+        rooms.set(DEFAULT_ROOM_CODE, room);
+        log(room, `${player.name}님이 새 게임의 호스트로 입장했습니다.`);
+        sendJson(res, 200, { room: serializeRoom(room, player.id), playerId: player.id });
+        return;
+      }
+      if (!room && !body.code) {
+        room = createRoom(DEFAULT_ROOM_CODE, player);
+        rooms.set(DEFAULT_ROOM_CODE, room);
+        log(room, `${player.name}님이 호스트로 입장했습니다.`);
+        sendJson(res, 200, { room: serializeRoom(room, player.id), playerId: player.id });
+        return;
+      }
+      if (!room) return sendJson(res, 404, { error: "방을 찾을 수 없습니다." });
+      if (room.status !== "lobby") return sendJson(res, 400, { error: "이미 시작한 방입니다." });
+      if (room.players.length >= MAX_PLAYERS) return sendJson(res, 400, { error: `최대 ${MAX_PLAYERS}명까지 참가할 수 있습니다.` });
+
+      room.players.push(player);
+      log(room, `${player.name}님이 참가했습니다.`);
+      sendJson(res, 200, { room: serializeRoom(room, player.id), playerId: player.id });
+      return;
+    }
+
+    if (req.url === "/api/state" && req.method === "POST") {
+      const room = findRoom(body.code);
+      if (!room) return sendJson(res, 404, { error: "방을 찾을 수 없습니다. 새로 만든 방 코드인지 확인해주세요." });
+      sendJson(res, 200, { room: serializeRoom(room, body.playerId) });
+      return;
+    }
+
+    if (req.url === "/api/start" && req.method === "POST") {
+      const room = findRoom(body.code);
+      if (!room) return sendJson(res, 404, { error: "방을 찾을 수 없습니다. 새로 만든 방 코드인지 확인해주세요." });
+      if (room.hostId !== body.playerId) return sendJson(res, 403, { error: "방장만 시작할 수 있습니다." });
+      if (room.players.length < 2) return sendJson(res, 400, { error: "최소 2명이 필요합니다." });
+
+      room.status = "playing";
+      room.players.forEach((player) => {
+        player.coins = 1;
+        player.alive = true;
+        player.usedPolice = false;
+        player.skipped = false;
+      });
+      assignRoles(room);
+      room.turnIndex = 0;
+      room.winnerId = null;
+      room.presidentBlocked = false;
+      log(room, "게임이 시작되었습니다. 모두 1코인을 받았습니다.");
+      beginTurn(room);
+      sendJson(res, 200, { room: serializeRoom(room, body.playerId) });
+      return;
+    }
+
+    if (req.url === "/api/action" && req.method === "POST") {
+      const room = findRoom(body.code);
+      if (!room) return sendJson(res, 404, { error: "방을 찾을 수 없습니다. 새로 만든 방 코드인지 확인해주세요." });
+      const actor = room.players.find((player) => player.id === body.playerId);
+      const target = room.players.find((player) => player.id === body.targetId);
+      if (!actor) return sendJson(res, 404, { error: "플레이어를 찾을 수 없습니다." });
+      if (!requireTurn(room, actor.id)) return sendJson(res, 400, { error: "지금은 당신의 행동 차례가 아닙니다." });
+
+      if (body.type === "pass") {
+        log(room, `${actor.name}님이 턴을 넘겼습니다.`);
+        nextTurn(room);
+        return sendJson(res, 200, { room: serializeRoom(room, actor.id) });
+      }
+
+      if (body.type === "erase") {
+        if (!target || !target.alive || target.id === actor.id) return sendJson(res, 400, { error: "대상을 고를 수 없습니다." });
+        if (actor.coins < 5) return sendJson(res, 400, { error: "5코인이 필요합니다." });
+        actor.coins -= 5;
+        const removed = removeRandomRole(room, target);
+        log(room, `${actor.name}님이 5코인을 사용해 ${target.name}님의 직업 하나를 지웠습니다.`);
+        log(room, `사라진 내 직업: ${removed}`, target.id);
+        nextTurn(room);
+        return sendJson(res, 200, { room: serializeRoom(room, actor.id) });
+      }
+
+      if (!actor.roles.includes(body.type)) return sendJson(res, 400, { error: "보유한 직업 능력이 아닙니다." });
+
+      if (body.type === "대통령") {
+        if (room.presidentBlocked) {
+          room.presidentBlocked = false;
+          log(room, `${actor.name}님의 대통령 능력은 법무관의 차단으로 막혔습니다.`);
+        } else {
+          assignRoles(room);
+          log(room, `${actor.name}님이 대통령 능력으로 모든 생존자의 직업을 다시 정했습니다.`);
+        }
+        nextTurn(room);
+        return sendJson(res, 200, { room: serializeRoom(room, actor.id) });
+      }
+
+      if (body.type === "법무관") {
+        room.presidentBlocked = true;
+        log(room, `${actor.name}님이 다음 대통령 능력을 막을 준비를 했습니다.`);
+        nextTurn(room);
+        return sendJson(res, 200, { room: serializeRoom(room, actor.id) });
+      }
+
+      if (body.type === "경찰") {
+        if (!target || !target.alive || target.id === actor.id) return sendJson(res, 400, { error: "대상을 고를 수 없습니다." });
+        if (actor.usedPolice) return sendJson(res, 400, { error: "경찰 능력은 한 번만 사용할 수 있습니다." });
+        actor.usedPolice = true;
+        const seen = target.roles[Math.floor(Math.random() * target.roles.length)];
+        log(room, `${actor.name}님이 경찰 능력으로 ${target.name}님의 직업 하나를 확인했습니다.`);
+        log(room, `${target.name}님의 직업 하나: ${seen}`, actor.id);
+        nextTurn(room);
+        return sendJson(res, 200, { room: serializeRoom(room, actor.id) });
+      }
+
+      if (body.type === "산업스파이") {
+        if (!target || !target.alive || target.id === actor.id) return sendJson(res, 400, { error: "대상을 고를 수 없습니다." });
+        if (target.coins <= 0) return sendJson(res, 400, { error: "대상에게 빼앗을 코인이 없습니다." });
+        target.coins -= 1;
+        actor.coins += 1;
+        log(room, `${actor.name}님이 산업스파이 능력으로 ${target.name}님의 코인 1개를 빼앗았습니다.`);
+        nextTurn(room);
+        return sendJson(res, 200, { room: serializeRoom(room, actor.id) });
+      }
+
+      if (body.type === "군인") {
+        if (!target || !target.alive || target.id === actor.id) return sendJson(res, 400, { error: "대상을 고를 수 없습니다." });
+        target.skipped = true;
+        log(room, `${actor.name}님이 군인 능력으로 ${target.name}님의 다음 차례를 넘기게 했습니다.`);
+        nextTurn(room);
+        return sendJson(res, 200, { room: serializeRoom(room, actor.id) });
+      }
+
+      if (body.type === "학생") {
+        return sendJson(res, 400, { error: "학생은 차례 시작 때 자동으로 2코인을 받습니다." });
+      }
+
+      sendJson(res, 400, { error: "알 수 없는 행동입니다." });
+      return;
+    }
+
+    sendJson(res, 404, { error: "API를 찾을 수 없습니다." });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message });
+  }
+}
+
+function serveStatic(req, res) {
+  const urlPath = req.url === "/" ? "/index.html" : req.url;
+  const filePath = path.normalize(path.join(PUBLIC_DIR, urlPath));
+  if (!filePath.startsWith(PUBLIC_DIR)) {
+    res.writeHead(403);
+    res.end("Forbidden");
+    return;
+  }
+
+  fs.readFile(filePath, (error, data) => {
+    if (error) {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+    const ext = path.extname(filePath);
+    const types = {
+      ".html": "text/html; charset=utf-8",
+      ".css": "text/css; charset=utf-8",
+      ".js": "application/javascript; charset=utf-8",
+      ".json": "application/json; charset=utf-8",
+      ".svg": "image/svg+xml; charset=utf-8",
+    };
+    res.writeHead(200, { "Content-Type": types[ext] || "application/octet-stream" });
+    res.end(data);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  if (req.url.startsWith("/api/")) {
+    handleApi(req, res);
+  } else {
+    serveStatic(req, res);
+  }
+});
+
+loadRooms();
+
+server.listen(PORT, () => {
+  console.log(`Secret role coin game: http://localhost:${PORT}`);
+});
